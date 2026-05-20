@@ -1,0 +1,941 @@
+---
+title: "exceptions"
+output: html_document
+date: "2026-03-24"
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(haven)
+library(lubridate)
+library(ggsurvfit)
+library(gtsummary)
+library(readr)
+library(readxl)
+library(survival)
+library(tidycmprsk)
+library(consort)
+library(coxme)
+library(modelbased)
+library(cowplot)
+library(broom)
+library(xtable)
+library(patchwork)
+
+```
+
+```{r}
+cand_thor <- read_sas("./pubsaf2506/cand_thor.sas7bdat", NULL)|> 
+  subset(WL_ORG == "HR" & REC_TX_DT >= mdy("01-01-2019") & REC_TX_DT <= mdy("03-31-2024"))
+
+just_form_hr <- read_sas("./HRStatJust2509/JustFormHR.sas7bdat") 
+just_form_hr_data_link <- read_sas("./HRStatJust2509/JustFormHRDataLink.sas7bdat")
+risk_strat_data_hr = read_sas("./HRStatJust2509/RiskStratDataHR.sas7bdat") |> 
+  select(px_id, WlregAuditId)
+just_form_hr = left_join(just_form_hr, just_form_hr_data_link, by = "JustId")
+just_form_hr = left_join(just_form_hr, risk_strat_data_hr, by = "WlregAuditId")
+cand_thor = left_join(cand_thor, select(just_form_hr, px_id, Exception, FormStatus, FormExpirationDt, FormEffectiveDt, RequestedCandStat_descrip), by = c("PX_ID" = "px_id")) |> 
+  relocate(Exception, FormStatus, FormExpirationDt, FormEffectiveDt, RequestedCandStat_descrip)
+cand_thor = cand_thor |>
+  mutate(
+    requested_status = str_replace(RequestedCandStat_descrip, "^Adult\\s+", ""),
+    final_status = case_when(
+           CAN_LAST_STAT %in% c('1010', '1020', '1090', '1110', '2010', '2020', '2090', '2110', '3010', '6010', '6011', '6012', '9010') ~ "Status 1",
+           CAN_LAST_STAT %in% c('1030', '1120', '2030', '2120', '6002', '6020', '6030', '9020') ~ "Status 2",
+           CAN_LAST_STAT %in% c('1130', '2130', '6040') ~ "Status 3",
+           CAN_LAST_STAT %in% c('1140', '2140', '6004') ~ "Status 4",
+           CAN_LAST_STAT %in% c('1150', '2150') ~ "Status 5",
+           CAN_LAST_STAT %in% c('1160', '2160') ~ "Status 6",
+           .default = NA),    
+    active_approved_exception = ifelse(Exception ==1 & FormStatus == 2 & REC_TX_DT >= FormEffectiveDt & REC_TX_DT <= FormExpirationDt & final_status == requested_status, 1, 0),
+   approved_exception  = ifelse(Exception ==1 & FormStatus == 2, 1, 0)) |> 
+  group_by(PX_ID) |> 
+  mutate(
+  active_approved_exception = ifelse(any(active_approved_exception == 1), 1, 0),
+  approved_exception = ifelse(any(approved_exception ==1),1,0),
+  ) |> 
+  arrange(REC_TX_DT, .by_group = T) |> 
+  slice(1) |> 
+  ungroup() |> 
+  mutate(
+  active_approved_exception = ifelse(is.na(active_approved_exception), 0, active_approved_exception),
+  approved_exception = ifelse(is.na(approved_exception),0,approved_exception) 
+  ) |> 
+  relocate(active_approved_exception, approved_exception, requested_status, final_status) 
+
+
+```
+
+
+# Children's Transplant centers
+```{r}
+institution <- read_sas("./pubsaf2506/institution.sas7bdat")
+
+institution = institution |> 
+  group_by(CTR_CD) |> 
+  filter(REGION != 98) |> 
+  mutate(children_hospital = ifelse(grepl("Children", ENTIRE_NAME, ignore.case = T), 1,0),
+         children_hospital = ifelse(str_sub(CTR_CD, -2) != "CH" & children_hospital == 1, 0, children_hospital),
+         children_hospital = ifelse(str_sub(CTR_CD, -2) == "CH" & children_hospital == 0, 1, children_hospital),
+         region = factor(REGION,
+                           levels = c(1,2,3,4,5,6,7,8,9,10,11))) |> 
+  ungroup() |> 
+  distinct(CTR_CD, children_hospital, region, .keep_all = TRUE)
+
+cand_thor = left_join(cand_thor, dplyr::select(institution, CTR_CD, children_hospital,region), by = c("CAN_LISTING_CTR_CD" = "CTR_CD"))
+
+```
+
+## Defining d-lvad at listing
+```{r}
+cand_thor = cand_thor |>
+  mutate(
+  dlvad = ifelse(
+        CAN_VAD1 %in% c('202', '205', '206', '207', '208', '209', '210', 
+                        '212', '213', '214', '223', '224', '233', '236', 
+                        '239', '240', '312', '313', '314', '315', '316', '319', '322', 
+                        '327', '330', '333', '334') | 
+        CAN_VAD2 %in%  c('202', '205', '206', '207', '208', '209', '210', 
+                        '212', '213', '214', '223', '224', '233', '236', 
+                        '239', '240', '312', '313', '314', '315', '316', '319', '322', 
+                        '327', '330', '333', '334'),
+        1, 0)) |> 
+  relocate(dlvad)
+```
+
+
+## Loading ADI and Assigning to ZIP
+```{r}
+ADI2023 <- read_csv("2023_ADI_11_FIPS.csv")
+ADI_crosswalk <-read_excel("11_digit_FIPS_to_ZIP_crosswalk.xlsx")
+
+ADI2023$FIPS_11_digit <- substr(ADI2023$FIPS, 1, 11) 
+ADI2023 <- left_join(ADI2023,
+                 dplyr::select(ADI_crosswalk, TRACT, ZIP), 
+                 by = c("FIPS_11_digit" = "TRACT") )
+ADI2023 <- ADI2023 |> 
+  group_by(ZIP) |> 
+  mutate(mean_adi = mean(as.numeric(ADI_NATRANK), na.rm = TRUE))
+ADI2023 |> 
+  dplyr::select(ZIP,  ADI_NATRANK, mean_adi) |> 
+  slice_head(n = 10)
+ADI2023 <- distinct(ADI2023, ZIP, .keep_all = TRUE)
+rm(ADI_crosswalk)
+
+
+cand_zip <- read_sas("canzip2506.sas7bdat", NULL)
+cand_zip$ZIP = substr(cand_zip$CAN_PERM_ZIP,1,5)
+cand_zip <- left_join(cand_zip, dplyr::select(ADI2023, mean_adi, ZIP), by = c("ZIP" = "ZIP"))
+rm(list = c("ADI2023"))
+
+slice_head(cand_zip,n= 5)
+
+cand_thor <- left_join(cand_thor,
+                    dplyr::select(cand_zip,PX_ID, mean_adi), 
+                    by = c("PX_ID" = "PX_ID"))
+
+cand_thor <- cand_thor %>%
+  mutate(mean_adi = as.numeric(as.character(mean_adi))) 
+
+cand_thor2 <- cand_thor
+
+# Use median score from transplant center listed at for candidates missing score percentile
+cand_thor <- cand_thor %>%
+  group_by(CAN_LISTING_CTR_CD) %>% # Gather by transplant center
+  mutate(median_adi = median(mean_adi, na.rm = T),
+         mean_adi = ifelse(is.na(mean_adi), median_adi, mean_adi),  #conditional to input corresponding composite score value
+         )  #conditional to input corresponding composite score value
+
+comparison <- inner_join(cand_thor, cand_thor2, by = "PX_ID", suffix = c("_new", "_orig"))
+imputations <- comparison %>%
+  summarise(
+    adi_diff = sum(is.na(mean_adi_new) != is.na(mean_adi_orig), na.rm = TRUE),
+    adi_percent = adi_diff / nrow(cand_thor))
+imputations
+rm(cand_thor2)
+
+# Split Percentiles into Deciles
+cand_thor <- cand_thor %>% 
+  group_by(PX_ID) %>%
+  mutate(adi_decile_factor = cut(mean_adi,c(-Inf, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100), labels = c("1st Decile", "2nd Decile", "3rd Decile", "4th Decile", "5th Decile", "6th Decile", "7th Decile", "8th Decile", "9th Decile", "10th Decile")))
+cand_thor <- cand_thor |> 
+  mutate(adi_decile_num = as.numeric(adi_decile_factor))
+```
+
+```{r}
+cand_thor <- cand_thor |> 
+  mutate(
+  insurance = as.factor(case_when(
+    CAN_PRIMARY_PAY == 1 ~ "Private insurance",
+    CAN_PRIMARY_PAY %in% c(2, 3, 4, 5, 6, 7) ~ "Public insurance",
+    CAN_PRIMARY_PAY == 8 ~ "Self",
+    CAN_PRIMARY_PAY == 9 ~ "Donation",
+    CAN_PRIMARY_PAY == 10 ~ "Free Care",
+    CAN_PRIMARY_PAY == 11 ~ "Pending",
+    CAN_PRIMARY_PAY == 12 ~ "Foreign Government",
+    CAN_PRIMARY_PAY == 13 ~ "Medicare Unspecified",
+    CAN_PRIMARY_PAY == 14 ~ "US/State Govt Agency",
+    CAN_PRIMARY_PAY == 15 ~ "Unknown",
+    TRUE ~ "Other")),
+  education = case_when(
+    CAN_EDUCATION == 1 ~ "None",
+    CAN_EDUCATION == 2 ~ "Grade School (0-8)",
+    CAN_EDUCATION == 3 ~ "High School (9-12) or GED",
+    CAN_EDUCATION == 4 ~ "Attended College/Technical School",
+    CAN_EDUCATION == 5 ~ "Associate/Bachelor Degree",
+    CAN_EDUCATION == 6 ~ "Post-College Graduate Degree",
+    CAN_EDUCATION == 998 ~ "Unknown",
+    TRUE ~ "Other"),
+  can_race = case_when(
+    CAN_RACE == "8" | CAN_RACE_SRTR == "WHITE" ~ "White",
+    CAN_RACE == "16" | CAN_RACE_SRTR == "BLACK" ~ "Black or African American",
+    CAN_RACE == "32" | CAN_RACE_SRTR == "NATIVE" ~ "American Indian or Alaska Native",
+    CAN_RACE == "64" | CAN_RACE_SRTR == "ASIAN" ~ "Asian",
+    CAN_RACE == "128" | CAN_RACE_SRTR == "PACIFIC" ~ "Native Hawaiian or Other Pacific Islander",
+    CAN_RACE_SRTR == "MULTI" ~ "Multiracial",
+    .default = "Other"),
+    ethnicity = case_when(
+      CAN_ETHNICITY_SRTR == "NLATIN" ~ "Not Latinx",
+      CAN_ETHNICITY_SRTR == "LATINO" ~ "Latinx"),
+  diagnosis = case_when(
+          CAN_DGN>999 & CAN_DGN<1007 ~ "Dilated cardiomyopathy, non-ischemic",
+          CAN_DGN == 1007 | CAN_DGN ==1200 ~ "Ischemic cardiomyopathy",
+          CAN_DGN>1048 & CAN_DGN< 1100 ~ "Restrictive cardiomyopathy",
+          CAN_DGN %in% c(1203, 1205, 1206, 1207) ~ "Congenital Heart Disease",
+          TRUE ~ "Other"),
+  diagnosis = factor(diagnosis, 
+                           levels = c("Dilated cardiomyopathy, non-ischemic", 
+                                      "Ischemic cardiomyopathy", 
+                                      "Restrictive cardiomyopathy",
+                                      "Congenital Heart Disease",
+                                      "Other")
+                     )
+  )
+
+
+cand_thor$can_race <- as.factor(cand_thor$can_race) |> relevel(cand_thor$can_race, ref = "White")
+cand_thor$ethnicity <-as.factor(cand_thor$ethnicity) |> relevel(cand_thor$ethnicity, ref = "Not Latinx")
+cand_thor$insurance <- relevel(cand_thor$insurance, ref = "Public insurance")
+```
+
+```{r}
+#load other transplant sets for multi listing check
+setwd("C:/Users/alexa/Downloads")
+cand_kipa = read_sas("./cand_kipa.sas7bdat")
+cand_liin = read_sas("./cand_liin.sas7bdat")
+```
+
+
+```{r cars}
+
+#function to check overlapping listings
+check_overlap <- function(heart_df, other_df) {
+  # Filter for common PERS_ID
+  common_ids <- intersect(heart_df$PERS_ID, other_df$PERS_ID)
+  
+  # Subset datasets to only include common PERS_ID
+  filtered_heart_df <- heart_df %>% filter(PERS_ID %in% common_ids)
+  filtered_other_df <- other_df %>% filter(PERS_ID %in% common_ids)
+  
+  # Join heart_df with the filtered other_df for date comparison
+  result <- filtered_heart_df %>%
+    left_join(filtered_other_df, by = "PERS_ID", suffix = c("_heart", "_other")) %>%
+    filter(
+      # Case 1: Overlap with removal date
+      (CAN_LISTING_DT_heart >= CAN_LISTING_DT_other & 
+       CAN_LISTING_DT_heart <= CAN_REM_DT_other) |
+      # Case 2: No removal date, listing dates must match or overlap
+      (is.na(CAN_REM_DT_other) & CAN_LISTING_DT_heart >= CAN_LISTING_DT_other)
+    )
+  
+  return(result)
+}
+
+# Check overlap for both CAND_KIPA and CAND_LIIN
+overlap_kipa <- check_overlap(cand_thor, cand_kipa)
+overlap_liin <- check_overlap(cand_thor, cand_liin)
+overlap_kipa <- overlap_kipa %>% dplyr::select(PERS_ID, WL_ORG_heart, WL_ORG_other)
+overlap_kipa = as.data.frame(overlap_kipa %>% group_by(PERS_ID) %>% distinct())
+overlap_liin = overlap_liin %>% dplyr::select(PERS_ID, WL_ORG_heart, WL_ORG_other)
+overlap_liin = as.data.frame(overlap_liin %>% group_by(PERS_ID) %>% distinct())
+# Combine results
+overlap_results <- bind_rows(
+  overlap_kipa %>% mutate(Source = "CAND_KIPA"),
+  overlap_liin %>% mutate(Source = "CAND_LIIN")
+)
+
+#one entry for every patient
+consolidated_overlap <- overlap_results %>%
+  group_by(PERS_ID) %>%
+  dplyr::summarize(WL_ORG_combined = paste(unique(WL_ORG_other), collapse = ", "), .groups = "drop")
+consolidated_overlap
+
+cand_thor <- cand_thor %>%
+  left_join(consolidated_overlap, by = "PERS_ID") %>%
+  mutate(
+    WL_ORG_other_combined = ifelse(is.na(WL_ORG_combined), "None", WL_ORG_combined)
+  )
+
+#indicator variable for multiple listings
+cand_thor = cand_thor %>% mutate(
+  multi_listed = ifelse(!is.na(WL_ORG_combined), 1, 0)
+)
+```
+
+```{r figure 1: strobe diagram}
+tx_hr = read_sas("./pubsaf2506/tx_hr.sas7bdat")
+tx_hr = left_join(tx_hr, select(cand_thor, approved_exception, active_approved_exception, PX_ID), by = "PX_ID") |> 
+  relocate(approved_exception, active_approved_exception)
+
+
+cand_thor <- cand_thor %>%
+  group_by(PERS_ID) %>%
+  mutate(
+    eligibility = case_when(
+      CAN_AGE_AT_LISTING < 18 ~ "Pediatric candidates",
+      children_hospital == 1 ~ "Listed at Pediatric Transplant Center",
+      !(PX_ID %in% tx_hr$PX_ID) ~ "Not transplanted",
+      .default = NA)) |> 
+  ungroup() |> 
+  mutate(
+    eligibility = ifelse(duplicated(PERS_ID), "Second transplant during study period", eligibility),
+    unique_candidates = ifelse(is.na(eligibility), 1, NA))
+
+txt <- gen_text(rep("Heart transplant recipients during study period", 20729))
+fig1 <- add_box(txt = txt)
+
+
+# Generate text without automatic count for "Multiple listings"
+txt <- gen_text(cand_thor$eligibility, label = "Excluded", bullet = TRUE)
+
+# Add the customized text to the side box
+fig1 <- add_side_box(fig1, txt = txt)
+
+fig1 <- add_box(fig1, txt = gen_text(cand_thor$unique_candidates, label = "Unique adult transplant recipients"))
+
+
+## Creating Analytic Sample 
+eligible_candidates = cand_thor |> subset(is.na(eligibility))
+tx_hr = left_join(tx_hr, select(cand_thor, PX_ID, can_race, adi_decile_factor, adi_decile_num, mean_adi, education, insurance, multi_listed, dlvad, diagnosis, region, final_status), by = "PX_ID") 
+tx_hr <- tx_hr |> 
+ subset(PX_ID %in% eligible_candidates$PX_ID) |> 
+  group_by(PX_ID) |>
+  arrange(REC_TX_DT, .by_group = TRUE) |>  
+  slice_head(n = 1) |>   
+  mutate(
+   active_approved_exception_plot = ifelse(active_approved_exception == 1, 
+                                    "Active approved status exception", "No active approved status exception"),
+   active_approved_exception_plot = fct_rev(active_approved_exception_plot)) |> 
+  ungroup()
+   
+
+txt = gen_text(tx_hr$active_approved_exception_plot,  bullet = TRUE)
+fig1 <- add_box(
+  fig1,
+  txt = txt, just = "left")
+
+
+plot(fig1, grViz = TRUE)
+
+ggsave("strobe_diagram.png", 
+       plot = build_grid(fig1),
+       width = 8,
+       height =4,
+       bg = "white")
+
+
+```
+
+
+```{r}
+tx_hr = tx_hr |> 
+  mutate(
+    start_date = as.Date(REC_TX_DT),
+    graft_fail_date = as.Date(TFL_GRAFT_DT),
+    last_fu_date = as.Date(TFL_ENDTXFU),
+    death_date = as.Date(TFL_DEATH_DT),
+    last_graft_fu_date = as.Date(TFL_LAFUDATE),
+    death_date_max = pmax(TFL_DEATH_DT, PERS_SSA_DEATH_DT, PERS_OPTN_DEATH_DT, na.rm=T)) %>%
+  
+  mutate(graft_fail_time = ifelse(!is.na(graft_fail_date), 
+                                  as.numeric(graft_fail_date - start_date, units='days'), NA)) %>%
+  mutate(death_time = ifelse(!is.na(death_date_max), as.numeric(death_date_max - start_date, units='days'), NA)) %>%
+  mutate(fu_time = as.numeric(pmax(last_fu_date, last_graft_fu_date, na.rm = T) - 
+                                     start_date, units='days')
+  )
+tx_hr = tx_hr |> 
+  mutate(survival_time = pmin(graft_fail_time, death_time, fu_time, na.rm = TRUE),
+         survival_time = ifelse(survival_time > 365, 365, survival_time)) |> #one year survival
+  group_by(PX_ID) |> 
+    mutate(status = case_when(
+      survival_time == death_time ~ 1,
+      survival_time == graft_fail_time  ~ 2,
+      survival_time == fu_time ~ 0,
+      .default = 0))
+tx_hr$status = factor(tx_hr$status,
+         levels = c(0,1,2),
+         labels = c("censor",  "death","graft failure"))
+tx_hr = tx_hr |> 
+  mutate(combined_status= case_when(
+    status == "censor" ~ 0,
+    status == "death" ~ 1,
+    status == "graft failure" ~ 1,
+    .default = 0))
+
+#impute missing height and weight
+tx_hr$CAN_HGT_CM[is.na(tx_hr$CAN_HGT_CM)] <-median(tx_hr$CAN_HGT_CM, na.rm=T)
+tx_hr$CAN_WGT_KG[is.na(tx_hr$CAN_WGT_KG)] <-median(tx_hr$CAN_WGT_KG, na.rm=T)
+```
+
+
+```{r}
+tx_hr = tx_hr |> 
+  mutate(
+    transplant_year = year(REC_TX_DT),
+    transplant_year = factor(transplant_year,
+                             levels = c(2019, 2020, 2021, 2022, 2023, 2024)),
+    diabetes = case_when(
+      CAN_DIAB %in% c(2,3,4) ~ 1,
+      CAN_DIAB_TY %in% c(2,3,4,5) ~ 1,
+      .default = 0
+    ),
+    ventilation = ifelse(REC_VENTILATOR_SUPPORT == "Y", 1, 0),
+    rec_phm = case_when(
+      CAN_GENDER == "M" ~ 
+        (8.25 * (CAN_HGT_CM/100)^(0.54) * (CAN_WGT_KG)^(0.61)) + (11.25 * REC_AGE_AT_TX^(-0.32) * (CAN_HGT_CM/100)^(1.135) * CAN_WGT_KG^(0.315)),
+      CAN_GENDER == "F" ~ (6.82 * (CAN_HGT_CM/100)^(0.54) * (CAN_WGT_KG)^(0.61)) + (10.59 * REC_AGE_AT_TX^(-0.32) * (CAN_HGT_CM/100)^(1.135) * CAN_WGT_KG^(0.315)),
+      .default = NA),
+    don_phm = case_when(
+      DON_GENDER == "M" ~ 
+        (8.25 * (DON_HGT_CM/100)^(0.54) * (DON_WGT_KG)^(0.61)) + (11.25 * DON_AGE^(-0.32) * (DON_HGT_CM/100)^(1.135) * DON_WGT_KG^(0.315)),
+      DON_GENDER == "F" ~ (6.82 * (DON_HGT_CM/100)^(0.54) * (DON_WGT_KG)^(0.61)) + (10.59 * DON_AGE^(-0.32) * (DON_HGT_CM/100)^(1.135) * DON_WGT_KG^(0.315)),
+      .default = NA),
+    phm_ratio = don_phm / rec_phm,
+    size_mismatch = ifelse(phm_ratio < 0.86, 1, 0))|> 
+  relocate(diabetes, ventilation, rec_phm, don_phm, phm_ratio, size_mismatch)
+
+```
+
+
+
+```{r US-TRS labs}
+riskstratdataHR =read_sas("./HRStatJust2509/RiskStratDataHR.sas7bdat")
+column_descriptions = read_sas("./ColumnDescriptions.sas7bdat")
+riskstratdataHR = riskstratdataHR |> 
+  subset(px_id %in% tx_hr$PX_ID) |> 
+  dplyr::select(px_id, contains("HrSevFail")) |> 
+  mutate(PX_ID = px_id) |> dplyr::select(-px_id)
+riskstratdataHR = left_join(riskstratdataHR, dplyr::select(cand_thor, PX_ID, CAN_LISTING_DT, CAN_AGE_AT_LISTING, CAN_GENDER), by = "PX_ID")
+riskstratdataHR = riskstratdataHR |>
+  group_by(PX_ID) |>
+  fill(HrSevFailNtBnpType, .direction='downup') |> 
+  mutate(
+    eGFR = case_when(
+    CAN_GENDER == 'F' & !is.na(HrSevFailCreatinine) ~ 142 * (pmin((HrSevFailCreatinine / 0.7), 1)^(-0.241)) *
+      (pmax((HrSevFailCreatinine / 0.7), 1)^(-1.2)) * 0.9938^(CAN_AGE_AT_LISTING) * 1.012,
+    
+    CAN_GENDER == 'M' & !is.na(HrSevFailCreatinine) ~ 142 * (pmin((HrSevFailCreatinine / 0.9), 1)^(-0.302)) *
+      (pmax((HrSevFailCreatinine / 0.7), 1)^(-1.2)) * 0.9938^(CAN_AGE_AT_LISTING)
+    ),
+    albumin = median(HrSevFailAlbumin, na.rm = T),
+    bilirubin = median(HrSevFailBilirubin, na.rm = T)) |> 
+  distinct(PX_ID, .keep_all = T)
+
+tx_hr = left_join(tx_hr, dplyr::select(riskstratdataHR, eGFR, albumin, bilirubin), by = "PX_ID")
+tx_hr$albumin[is.na(tx_hr$albumin)] <- median(tx_hr$albumin, na.rm = T)
+tx_hr$bilirubin[is.na(tx_hr$bilirubin)] <- median(tx_hr$bilirubin, na.rm = T)
+tx_hr$eGFR[is.na(tx_hr$eGFR)] <- median(tx_hr$eGFR, na.rm = T)
+
+```
+
+```{r table 1}
+tx_hr = tx_hr |> mutate(cod = factor(TFL_COD))
+table1 = tx_hr |> 
+  dplyr::select(REC_AGE_AT_TX, CAN_GENDER, can_race, mean_adi, CAN_ETHNICITY_SRTR, education, insurance, CAN_ABO, CAN_WGT_KG, CAN_HGT_CM, PX_ID, multi_listed, dlvad, diagnosis, active_approved_exception_plot, region, final_status, DON_AGE, DON_GENDER, albumin, bilirubin, eGFR, diabetes, ventilation, size_mismatch, transplant_year, cod) |> 
+  group_by(PX_ID) |> 
+  tbl_summary(,
+    label = list( 
+    can_race ~ "Race",
+    REC_AGE_AT_TX ~ "Age at Tx",
+    CAN_GENDER ~ "Sex",
+    CAN_ETHNICITY_SRTR ~ "Ethnicity",
+    education ~ "Education Level",
+    insurance ~ "Primary Payment Type",
+    mean_adi ~ "ADI Percentile",
+    dlvad ~ "Durable LVAD",
+    diagnosis ~ "Primary Diagnosis"  
+    ),
+  statistic = list(all_continuous() ~ "{mean} ({sd})", all_categorical() ~ "{n} ({p}%)")) |>  
+  modify_table_body(filter, !(variable == "PX_ID" ))
+
+table1_stratified = tx_hr |> 
+  dplyr::select(REC_AGE_AT_TX, CAN_GENDER, can_race, mean_adi, CAN_ETHNICITY_SRTR, education, insurance, CAN_ABO, CAN_WGT_KG, CAN_HGT_CM, PX_ID, multi_listed,  dlvad, diagnosis, active_approved_exception_plot, region, final_status, DON_AGE, DON_GENDER, albumin, bilirubin, eGFR, diabetes, ventilation, size_mismatch, transplant_year, cod) |> 
+  group_by(PX_ID) |> 
+  tbl_summary(by = active_approved_exception_plot,
+    label = list( 
+    can_race ~ "Race",
+    REC_AGE_AT_TX ~ "Age at Tx",
+    CAN_GENDER ~ "Sex",
+    CAN_ETHNICITY_SRTR ~ "Ethnicity",
+    insurance ~ "Primary Payment Type",
+    education ~ "Education Level",
+    mean_adi ~ "ADI Percentile",
+    dlvad ~ "Durable LVAD",
+    diagnosis ~ "Primary Diagnosis"
+  ),
+  statistic = list(all_continuous() ~ "{mean} ({sd})", all_categorical() ~ "{n} ({p}%)")) |>  
+  modify_table_body(filter, !(variable == "PX_ID" ))|> 
+  add_p(test = list(diagnosis ~ "fisher.test", CAN_ABO ~ "fisher.test", can_race ~ "fisher.test", education ~ "fisher.test", insurance ~ "fisher.test", cod ~ "fisher.test"), test.args = list(diagnosis = list(simulate.p.value = TRUE), CAN_ABO = list(simulate.p.value = TRUE), can_race = list(simulate.p.value = TRUE), education = list(simulate.p.value = TRUE), insurance = list(simulate.p.value = T), cod = list(simulate.p.value = TRUE)))
+
+
+ table1
+ table1_stratified
+ 
+```
+
+```{r table 1 for only status 2}
+table1_status2 = tx_hr |> 
+  filter(final_status == "Status 2") |> 
+  dplyr::select(REC_AGE_AT_TX, CAN_GENDER, can_race, mean_adi, CAN_ETHNICITY_SRTR, education, insurance, CAN_ABO, CAN_WGT_KG, CAN_HGT_CM, PX_ID, multi_listed, dlvad, diagnosis, active_approved_exception_plot, region,  DON_AGE, DON_GENDER, albumin, bilirubin, eGFR, diabetes, ventilation, size_mismatch, transplant_year, combined_status, cod) |> 
+  group_by(PX_ID) |> 
+  tbl_summary(,
+    label = list( 
+    can_race ~ "Race",
+    REC_AGE_AT_TX ~ "Age at Tx",
+    CAN_GENDER ~ "Sex",
+    CAN_ETHNICITY_SRTR ~ "Ethnicity",
+    education ~ "Education Level",
+    insurance ~ "Primary Payment Type",
+    mean_adi ~ "ADI Percentile",
+    dlvad ~ "Durable LVAD",
+    diagnosis ~ "Primary Diagnosis"  
+    ),
+  statistic = list(all_continuous() ~ "{mean} ({sd})", all_categorical() ~ "{n} ({p}%)")) |>  
+  modify_table_body(filter, !(variable == "PX_ID" ))
+
+table1_stratified_status2 = tx_hr |>   
+  filter(final_status == "Status 2") |> 
+  dplyr::select(REC_AGE_AT_TX, CAN_GENDER, can_race, mean_adi, CAN_ETHNICITY_SRTR, education, insurance, CAN_ABO, CAN_WGT_KG, CAN_HGT_CM, PX_ID, multi_listed,  dlvad, diagnosis,active_approved_exception_plot, region,  DON_AGE, DON_GENDER, albumin, bilirubin, eGFR, diabetes, ventilation, size_mismatch, transplant_year, combined_status, cod) |> 
+  group_by(PX_ID) |> 
+  tbl_summary(by = active_approved_exception_plot,
+    label = list( 
+    can_race ~ "Race",
+    REC_AGE_AT_TX ~ "Age at Tx",
+    CAN_GENDER ~ "Sex",
+    CAN_ETHNICITY_SRTR ~ "Ethnicity",
+    insurance ~ "Primary Payment Type",
+    education ~ "Education Level",
+    mean_adi ~ "ADI Percentile",
+    dlvad ~ "Durable LVAD",
+    diagnosis ~ "Primary Diagnosis"
+  ),
+  statistic = list(all_continuous() ~ "{mean} ({sd})", all_categorical() ~ "{n} ({p}%)")) |>  
+  modify_table_body(filter, !(variable == "PX_ID" ))|> 
+  add_p(test = list(diagnosis ~ "fisher.test", CAN_ABO ~ "fisher.test", can_race ~ "fisher.test", education ~ "fisher.test", insurance ~ "fisher.test", cod ~ "fisher.test"), test.args = list(diagnosis = list(simulate.p.value = TRUE), CAN_ABO = list(simulate.p.value = TRUE), can_race = list(simulate.p.value = TRUE), education = list(simulate.p.value = TRUE), insurance = list(simulate.p.value = T), cod = list(simulate.p.value = TRUE)))
+
+
+ table1_status2
+ table1_stratified_status2
+```
+```{r entire cohort death table}
+ table_death = tx_hr |> 
+  dplyr::select(REC_AGE_AT_TX, CAN_GENDER, can_race, mean_adi, CAN_ETHNICITY_SRTR, education, insurance, CAN_ABO, CAN_WGT_KG, CAN_HGT_CM, PX_ID, multi_listed,  dlvad, diagnosis,active_approved_exception_plot, region, final_status, DON_AGE, DON_GENDER, albumin, bilirubin, eGFR, diabetes, ventilation, size_mismatch, transplant_year, combined_status, cod) |> 
+  group_by(PX_ID) |> 
+  tbl_summary(by = combined_status,
+    label = list( 
+    can_race ~ "Race",
+    REC_AGE_AT_TX ~ "Age at Tx",
+    CAN_GENDER ~ "Sex",
+    CAN_ETHNICITY_SRTR ~ "Ethnicity",
+    insurance ~ "Primary Payment Type",
+    education ~ "Education Level",
+    mean_adi ~ "ADI Percentile",
+    dlvad ~ "Durable LVAD",
+    diagnosis ~ "Primary Diagnosis"
+  ),
+  statistic = list(all_continuous() ~ "{mean} ({sd})", all_categorical() ~ "{n} ({p}%)")) |>  
+  modify_table_body(filter, !(variable == "PX_ID" ))|> 
+  add_p(test = list(diagnosis ~ "fisher.test", CAN_ABO ~ "fisher.test", can_race ~ "fisher.test", education ~ "fisher.test", insurance ~ "fisher.test", cod ~ "fisher.test"), test.args = list(diagnosis = list(simulate.p.value = TRUE), CAN_ABO = list(simulate.p.value = TRUE), can_race = list(simulate.p.value = TRUE), education = list(simulate.p.value = TRUE), insurance = list(simulate.p.value = T), cod = list(simulate.p.value = TRUE)))
+
+ status2_table_death = tx_hr |> 
+  filter(final_status == "Status 2") |> 
+  dplyr::select(REC_AGE_AT_TX, CAN_GENDER, can_race, mean_adi, CAN_ETHNICITY_SRTR, education, insurance, CAN_ABO, CAN_WGT_KG, CAN_HGT_CM, PX_ID, multi_listed,  dlvad, diagnosis,active_approved_exception_plot, region, DON_AGE, DON_GENDER, albumin, bilirubin, eGFR, diabetes, ventilation, size_mismatch, transplant_year, combined_status, cod) |> 
+  group_by(PX_ID) |> 
+  tbl_summary(by = combined_status,
+    label = list( 
+    can_race ~ "Race",
+    REC_AGE_AT_TX ~ "Age at Tx",
+    CAN_GENDER ~ "Sex",
+    CAN_ETHNICITY_SRTR ~ "Ethnicity",
+    insurance ~ "Primary Payment Type",
+    education ~ "Education Level",
+    mean_adi ~ "ADI Percentile",
+    dlvad ~ "Durable LVAD",
+    diagnosis ~ "Primary Diagnosis"
+  ),
+  statistic = list(all_continuous() ~ "{mean} ({sd})", all_categorical() ~ "{n} ({p}%)")) |>  
+  modify_table_body(filter, !(variable == "PX_ID" ))|> 
+  add_p(test = list(diagnosis ~ "fisher.test", CAN_ABO ~ "fisher.test", can_race ~ "fisher.test", education ~ "fisher.test", insurance ~ "fisher.test", cod ~ "fisher.test"), test.args = list(diagnosis = list(simulate.p.value = TRUE), CAN_ABO = list(simulate.p.value = TRUE), can_race = list(simulate.p.value = TRUE), education = list(simulate.p.value = TRUE), insurance = list(simulate.p.value = T), cod = list(simulate.p.value = TRUE)))
+
+
+table_death
+status2_table_death
+
+```
+
+
+```{r figure 3: km curve stratified by final status}
+status1_curve = survfit2(Surv(survival_time, combined_status) ~ active_approved_exception_plot, data = filter(tx_hr, final_status == "Status 1")) |> 
+  ggsurvfit() +
+  labs(
+    x = "Days",
+    y = "Post-Transplant\nSurvival Probability",
+    title = "Status 1"
+  )+
+  add_confidence_interval()+
+  add_pvalue("annotation", size = 4) +
+  add_risktable()+
+  guides(
+    color = guide_legend(nrow = 2, byrow = TRUE),
+    fill = guide_legend(nrow = 2, byrow = TRUE),
+    linetype = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(fill = NA)))+
+  ylim(0.84,1)
+status2_curve = survfit2(Surv(survival_time, combined_status) ~ active_approved_exception_plot, data = filter(tx_hr, final_status == "Status 2")) |> 
+  ggsurvfit() +
+  labs(
+    x = "Days",
+    y = "Post-Transplant\nSurvival Probability",
+    title = "Status 2"
+  )+
+  add_confidence_interval()+
+  add_pvalue("annotation", size = 4) +
+  add_risktable()+
+  guides(
+    color = guide_legend(nrow = 2, byrow = TRUE),
+    fill = guide_legend(nrow = 2, byrow = TRUE),
+    linetype = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(fill = NA)))+
+  ylim(0.84,1)
+status3_curve = survfit2(Surv(survival_time, combined_status) ~ active_approved_exception_plot, data = filter(tx_hr, final_status == "Status 3")) |> 
+  ggsurvfit() +
+  labs(
+    x = "Days",
+    y = "Post-Transplant\nSurvival Probability",
+    title = "Status 3"
+  )+
+  add_confidence_interval()+
+  add_pvalue("annotation", size = 4) +
+  add_risktable()+
+  guides(
+    color = guide_legend(nrow = 2, byrow = TRUE),
+    fill = guide_legend(nrow = 2, byrow = TRUE),
+    linetype = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(fill = NA)))+
+  ylim(0.84,1)
+status4_curve = survfit2(Surv(survival_time, combined_status) ~ active_approved_exception_plot, data = filter(tx_hr, final_status == "Status 4")) |> 
+  ggsurvfit() +
+  labs(
+    x = "Days",
+    y = "Post-Transplant\nSurvival Probability",
+    title = "Status 4"
+  )+
+  add_confidence_interval()+
+  add_pvalue("annotation", size = 4) +
+  add_risktable()+
+  guides(
+    color = guide_legend(nrow = 2, byrow = TRUE),
+    fill = guide_legend(nrow = 2, byrow = TRUE),
+    linetype = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(fill = NA)))+
+  ylim(0.84,1)
+
+
+status1_curve
+status2_curve
+status3_curve
+status4_curve
+
+
+combined_km_curves = wrap_plots(
+  ggsurvfit::ggsurvfit_build(status1_curve),
+  ggsurvfit::ggsurvfit_build(status2_curve),
+  ggsurvfit::ggsurvfit_build(status3_curve),
+  ggsurvfit::ggsurvfit_build(status4_curve),
+  ncol = 2,
+  nrow = 2,
+  heights = c(8,8)) + 
+  theme(plot.background = element_rect(fill = "white", color = NA))
+  
+combined_km_curves
+ggsave("combined_km_curves.png", 
+       plot = combined_km_curves,
+       width = 9,
+       height =9,
+       bg = "white")
+
+```
+
+
+
+
+```{r main analysis: me cox models stratified by final status}
+set.seed(1234)
+
+#Status 1
+status1_un = coxme(Surv(survival_time, combined_status) ~ active_approved_exception  + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 1"))
+
+status1_partial = coxme(Surv(survival_time, combined_status) ~ active_approved_exception  + REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 1"))
+
+status1_fully_adjusted = coxme(Surv(survival_time, combined_status) ~ active_approved_exception +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 1"))
+
+
+#Status 2
+status2_un = coxme(Surv(survival_time, combined_status) ~ active_approved_exception  + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 2"))
+
+status2_partial = coxme(Surv(survival_time, combined_status) ~ active_approved_exception  + REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 2"))
+
+status2_fully_adjusted = coxme(Surv(survival_time, combined_status) ~ active_approved_exception +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 2"))
+
+
+#Status 3
+status3_un = coxme(Surv(survival_time, combined_status) ~ active_approved_exception  + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 3"))
+
+status3_partial = coxme(Surv(survival_time, combined_status) ~ active_approved_exception  + REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 3"))
+
+status3_fully_adjusted = coxme(Surv(survival_time, combined_status) ~ active_approved_exception +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 3"))
+
+
+#Status 4
+status4_un = coxme(Surv(survival_time, combined_status) ~ active_approved_exception  + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 4"))
+
+status4_partial = coxme(Surv(survival_time, combined_status) ~ active_approved_exception  + REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 4"))
+
+status4_fully_adjusted = coxme(Surv(survival_time, combined_status) ~ active_approved_exception +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 4"))
+
+```
+
+```{r sensitivity anlysis 1: approved exception ever stratified}
+set.seed(1234)
+
+#Status 1
+sens_status1_fully_adjusted = coxme(Surv(survival_time, combined_status) ~ approved_exception +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 1"))
+
+#Status 2
+sens_status2_fully_adjusted = coxme(Surv(survival_time, combined_status) ~ approved_exception +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 2"))
+
+#Status 3
+sens_status3_fully_adjusted = coxme(Surv(survival_time, combined_status) ~ approved_exception +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 3"))
+
+#Status 4
+sens_status4_fully_adjusted = coxme(Surv(survival_time, combined_status) ~ approved_exception +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_hr, final_status == "Status 4"))
+```
+
+
+```{r sensitivity analysis 2: 60 day survival with conditional 1 year by status}
+set.seed(1234)
+tx_hr$survival_time <- tx_hr$survival_time + 1e-9
+tx_split = survSplit(
+  data    = tx_hr,
+  cut     = 60,
+  end     = "survival_time",
+  start   = "tstart",
+  event   = "combined_status",
+  id      = "ID"
+)
+
+tx_split = tx_split |> 
+  mutate(
+    approved_exception_pre_60 = ifelse(active_approved_exception == 1 & tstart == 0, 1, 0),
+    approved_exception_post_60 = ifelse(active_approved_exception == 1 & tstart == 60, 1, 0)
+  ) |> 
+  relocate(ID:approved_exception_post_60, active_approved_exception)
+
+#Status 1
+status1_sixty_day_survival = coxme(Surv(tstart, survival_time, combined_status) ~ approved_exception_pre_60 + approved_exception_post_60 +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_split, final_status == "Status 1"))
+
+#Status 2
+status2_sixty_day_survival = coxme(Surv(tstart, survival_time, combined_status) ~ approved_exception_pre_60 + approved_exception_post_60 +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_split, final_status == "Status 2"))
+
+#Status 3
+status3_sixty_day_survival = coxme(Surv(tstart, survival_time, combined_status) ~ approved_exception_pre_60 + approved_exception_post_60 +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_split, final_status == "Status 3"))
+
+#Status 4
+status4_sixty_day_survival = coxme(Surv(tstart, survival_time, combined_status) ~ approved_exception_pre_60 + approved_exception_post_60 +  REC_AGE_AT_TX + log(bilirubin + 1) + eGFR  + diabetes + ventilation + size_mismatch + albumin + dlvad+ diagnosis + DON_AGE + DON_GENDER + size_mismatch + CAN_WGT_KG+ CAN_HGT_CM+ adi_decile_factor+ CAN_GENDER+ can_race+ CAN_ETHNICITY_SRTR+  multi_listed+ region   + CAN_ABO + transplant_year + (1|REC_CTR_CD), data = filter(tx_split, final_status == "Status 4"))
+
+```
+
+
+
+```{r}
+tidy.coxme <- function(x, exponentiate = FALSE, conf.int = 0.95, ...){
+  beta <- x$coefficients
+  nvar <- length(beta)
+  nfrail <- nrow(x$var) - nvar
+  nn <- c("estimate", "exp()", "std.error", "statistic", "p.value")
+  se <- sqrt(diag(as.matrix(x$var))[nfrail + 1:nvar])
+  z <- qnorm((1 + conf.int)/2, 0, 1)
+  ret <- data.frame(
+    "term"      = names(beta),
+    "estimate"  = beta,
+    "std.error" = se,
+    "statistic" = beta/se,
+    "p.value"   = 1 - pchisq((beta/se)^2, 1),
+    "conf.low"  =  beta - z * se,
+    "conf.high" =  beta + z * se
+  )
+  if (exponentiate) {
+    ret$estimate <- exp(ret$estimate)
+    ret$conf.low <- exp(ret$conf.low)
+    ret$conf.high <- exp(ret$conf.high)
+  }
+  rownames(ret) <- c(1:nrow(ret))
+  ret
+}
+
+
+create_clean_table <- function(data) {
+  # Process the data into the clean table format
+  clean_table <- data %>%
+    mutate(
+      Hazard_Ratio = exp(estimate), 
+      Confidence_Interval = paste0("(", round(exp(conf.low), 2), ", ", round(exp(conf.high), 2), ")") # Create CI as a string
+    ) %>%
+    dplyr::select(
+      Variable = term,
+      Coefficient = estimate,
+      Hazard_Ratio,
+      `Standard Error` = std.error,
+      `P-Value` = p.value,
+      `Confidence Interval` = Confidence_Interval
+    )
+  return(as.data.frame(clean_table))
+}
+save_df_as_html <- function(data, file_name) {
+  # Convert the data frame to an HTML table
+  data = create_clean_table(data)
+  html_table <- xtable(data)
+  
+  # Save the table as an HTML file
+  print(html_table, type = "html", file = file_name)
+  
+  # Inform the user
+  message("HTML table saved as ", file_name)
+}
+
+```
+
+```{r clean tables stratified by status}
+tidy_un = tidy.coxme(status1_un)
+save_df_as_html(tidy_un, "status1_unadjusted.html") # Supplemental Table 1
+tidy_partial = tidy.coxme(status1_partial)
+save_df_as_html(tidy_partial, "status1_partially_adjusted.html") # Supplemental Table 2
+tidy_full = tidy.coxme(status1_fully_adjusted)
+save_df_as_html(tidy_full, "status1_fully_adjusted.html") # Supplemental Table 3
+
+tidy_un = tidy.coxme(status2_un)
+save_df_as_html(tidy_un, "status2_unadjusted.html") # Supplemental Table 4
+tidy_partial = tidy.coxme(status2_partial)
+save_df_as_html(tidy_partial, "status2_partially_adjusted.html") # Supplemental Table 5
+tidy_full = tidy.coxme(status2_fully_adjusted)
+save_df_as_html(tidy_full, "status2_fully_adjusted.html") # Supplemental Table 6
+
+tidy_un = tidy.coxme(status3_un)
+save_df_as_html(tidy_un, "status3_unadjusted.html") # Supplemental Table 7
+tidy_partial = tidy.coxme(status3_partial)
+save_df_as_html(tidy_partial, "status3_partially_adjusted.html") # Supplemental Table 8
+tidy_full = tidy.coxme(status3_fully_adjusted)
+save_df_as_html(tidy_full, "status3_fully_adjusted.html") # Supplemental Table 9
+
+tidy_un = tidy.coxme(status4_un)
+save_df_as_html(tidy_un, "status4_unadjusted.html") # Supplemental Table 10
+tidy_partial = tidy.coxme(status4_partial)
+save_df_as_html(tidy_partial, "status4_partially_adjusted.html") # Supplemental Table 11
+tidy_full = tidy.coxme(status4_fully_adjusted)
+save_df_as_html(tidy_full, "status4_fully_adjusted.html") # Supplemental Table 12
+```
+
+```{r sensitivity clean tables stratified by status}
+
+tidy_full = tidy.coxme(sens_status1_fully_adjusted)
+save_df_as_html(tidy_full, "sens_status1_fully_adjusted.html") # Supplemental Table 13
+
+tidy_full = tidy.coxme(sens_status2_fully_adjusted)
+save_df_as_html(tidy_full, "sens_status2_fully_adjusted.html") # Supplemental Table 14
+
+tidy_full = tidy.coxme(sens_status3_fully_adjusted)
+save_df_as_html(tidy_full, "sens_status3_fully_adjusted.html") # Supplemental Table 15
+
+tidy_full = tidy.coxme(sens_status4_fully_adjusted)
+save_df_as_html(tidy_full, "sens_status4_fully_adjusted.html") # Supplemental Table 16
+```
+
+```{r 60 day survival clean tables}
+
+tidy_60 = tidy.coxme(status1_sixty_day_survival)
+save_df_as_html(tidy_60, "status1_sixty_day_survival.html") # Supplemental Table 17
+tidy_60 = tidy.coxme(status2_sixty_day_survival)
+save_df_as_html(tidy_60, "status2_sixty_day_survival.html") # Supplemental Table 18
+tidy_60 = tidy.coxme(status3_sixty_day_survival)
+save_df_as_html(tidy_60, "status3_sixty_day_survival.html") # Supplemental Table 19
+tidy_60 = tidy.coxme(status4_sixty_day_survival)
+save_df_as_html(tidy_60, "status4_sixty_day_survival.html") # Supplemental Table 20
+
+```
+
+
+```{r alt figure 2: number of exceptions by year, eval = F}
+
+status_exception_by_year = tx_hr |> 
+  filter(year(REC_TX_DT) %in% c(2019,2020,2021,2022,2023) & approved_exception == 1) |> 
+  ggplot()+ 
+  geom_bar(aes(x=year(REC_TX_DT), fill= final_status))+ 
+  facet_wrap(vars(final_status), axes = "all", axis.labels = "all_x") + 
+  theme_minimal()+ 
+  theme(legend.position = "none")+ 
+  scale_fill_viridis_d()+ 
+  labs( x = "Year of Transplant", y = "Number of Transplant Recipients" )
+
+status_exception_by_year
+ggsave("status_exceptions_year.png",
+       plot = status_exception_by_year,
+       height = 7,
+       width = 7,
+       bg = "white")
+```
+```{r figure 2: proportion of recipients with active exception}
+by_status = tx_hr |> 
+  filter(year(REC_TX_DT) %in% c(2019,2020,2021,2022,2023)) |> 
+  mutate(tx_yr = year(REC_TX_DT)) |> 
+  group_by(final_status, tx_yr) |> 
+  summarize(total_with = sum(approved_exception),
+            num_in_status = n(),
+            total_wo = num_in_status - total_with) |> 
+  mutate(
+    final_status = factor(final_status, levels = c("Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6")),
+    percent = total_with / num_in_status)
+
+long <- by_status %>%
+  pivot_longer(
+    cols = c(num_in_status, total_with,total_wo),
+    names_to = "metric",
+    values_to = "count"
+  )
+
+status_exception_by_year = ggplot(
+  data = subset(long, metric != "num_in_status"),
+  aes(x =tx_yr, y = count, fill = fct_rev(metric))) +
+  geom_col(position = "stack") +
+  facet_wrap(vars(final_status), axes = "all", axis.labels = "all_x") + 
+  theme_minimal()+ 
+  labs( x = "Year of Transplant", y = "", fill = "")+
+  scale_fill_viridis_d(labels = c("total_with" = "Recipients with active status exceptions","total_wo"  = "Total recipients in status"))
+
+status_exception_by_year
+ggsave("status_exceptions_year.png",
+       plot = status_exception_by_year,
+       height = 7,
+       width = 10,
+       bg = "white")
+```
+
